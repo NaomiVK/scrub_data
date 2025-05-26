@@ -22,6 +22,14 @@ SIN_PATTERN = r"(\d{3}\s*\d{3}\s*\d{3}|\d{3}\D*\d{3}\D*\d{3})"
 PHONE_PATTERN_1 = r"(\+\d{1,2}\s?)?1?\-?\.\s?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}"
 PHONE_PATTERN_2 = r"(?:(?:\+?1\s*(?:[.-]\s*)?)?(?:\(\s*([2-9]1[02-9]|[2-9][02-8]1|[2-9][02-8][02-9])\s*\)|([2-9]1[02-9]|[2-9][02-8]1|[2-9][02-8][02-9]))\s*(?:[.-]\s*)?)?([2-9]1[02-9]|[2-9][02-9]1|[2-9][02-9]{2})\s*(?:[.-]\s*)?([0-9]{4})(?:\s*(?:#|x\.?|ext\.?|extension)\s*(\d+))?"
 EMAIL_PATTERN = r"([a-zA-Z0-9_\-\.]+)\s*@([\sa-zA-Z0-9_\-\.]+)[\.\,]([a-zA-Z]{1,5})"
+# Regex for detecting common Date of Birth formats
+DOB_PATTERN = r"\b(\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})\b"
+# Regex for detecting PO Box and General Delivery addresses
+PO_BOX_PATTERN = r"\b(?:P(?:ost(?:al)?)?\.?\s*O(?:ffice)?\.?\s*Box|General Delivery)\s+\d+\b"
+# Regex for detecting common street address formats
+ADDRESS_PATTERN = r"\b[A-Za-z0-9]+\s+[A-Za-z0-9\s.-]+\s+(?:Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Drive|Dr|Boulevard|Blvd|Crescent|Cres|Court|Ct)\b"
+# Pattern to temporarily identify credit card numbers to prevent their accidental scrubbing.
+TEMP_CREDIT_CARD_IGNORE_PATTERN = r"\b(?:\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{1,4}|\d{13,16})\b"
 
 def clean_html(text):
     """Remove HTML tags from text"""
@@ -36,6 +44,16 @@ def scrub_pii(text):
         return text
     
     text = str(text)
+
+    # BEGIN CC IGNORE/RESTORE LOGIC
+    cc_matches = []
+    def cc_match_replacer(match):
+        cc_matches.append(match.group(0))
+        # Using .format() for Python 3.8 f-string equivalent for this specific placeholder
+        return "@@TEMP_CC_PLACEHOLDER_{}@@".format(len(cc_matches)-1)
+
+    text = re.sub(TEMP_CREDIT_CARD_IGNORE_PATTERN, cc_match_replacer, text, flags=re.IGNORECASE)
+    # END CC IGNORE LOGIC (part 1)
     
     # Replace patterns with ***
     text = re.sub(POSTAL_CODE_PATTERN, "***", text, flags=re.IGNORECASE)
@@ -44,21 +62,49 @@ def scrub_pii(text):
     text = re.sub(PHONE_PATTERN_1, "***", text, flags=re.IGNORECASE)
     text = re.sub(PHONE_PATTERN_2, "***", text, flags=re.IGNORECASE)
     text = re.sub(EMAIL_PATTERN, "***", text, flags=re.IGNORECASE)
+    text = re.sub(DOB_PATTERN, "***", text, flags=re.IGNORECASE)
+    text = re.sub(PO_BOX_PATTERN, "***", text, flags=re.IGNORECASE) # Added PO Box scrubbing
+    text = re.sub(ADDRESS_PATTERN, "***", text, flags=re.IGNORECASE) # Modified Address scrubbing
     
     # Use spaCy to detect and replace person names, organizations, and locations
     if nlp:
         try:
             doc = nlp(text)
-            # Process entities in reverse order to maintain string positions
-            entities = [(ent.start_char, ent.end_char, ent.label_) for ent in doc.ents]
-            entities.sort(reverse=True, key=lambda x: x[0])
+            # BEGIN UPDATED spaCy entity processing logic
+            entities_to_scrub_tuples = []
+            for ent in doc.ents:
+                if ent.text.upper() in ["PII", "DOB"] and ent.label_ in ["ORG", "PERSON", "PRODUCT", "WORK_OF_ART", "LAW", "EVENT"]: # Add more common mis-labels if observed
+                    # Skip these specific acronyms if they are misidentified
+                    # print("Skipping false positive entity: {} ({})".format(ent.text, ent.label_)) # Optional: for debugging
+                    pass
+                elif ent.label_ in ["PERSON", "ORG", "GPE", "LOC"]:
+                    entities_to_scrub_tuples.append((ent.start_char, ent.end_char, ent.label_))
             
-            for start, end, label in entities:
-                if label in ["PERSON", "ORG", "GPE", "LOC"]:
-                    text = text[:start] + "***" + text[end:]
-        except:
+            entities_to_scrub_tuples.sort(reverse=True, key=lambda x: x[0])
+            
+            for start, end, label in entities_to_scrub_tuples:
+                text = text[:start] + "***" + text[end:]
+            # END UPDATED spaCy entity processing logic
+        except Exception as e: # Catch all exceptions from spaCy processing
+            # print("SpaCy processing error: {}".format(e)) # Optional: for debugging
             pass
     
+    # BEGIN CC RESTORE LOGIC (part 2)
+    idx = 0
+    while True: # Loop as long as placeholders are found
+        # Using .format() for Python 3.8 f-string equivalent for this specific placeholder
+        placeholder_to_find = "@@TEMP_CC_PLACEHOLDER_{}@@".format(idx)
+        if placeholder_to_find in text:
+            if idx < len(cc_matches): # Check if we have a corresponding original CC
+                text = text.replace(placeholder_to_find, cc_matches[idx], 1) # Replace one instance
+            else:
+                # This case should ideally not happen if logic is correct
+                text = text.replace(placeholder_to_find, "[UNEXPECTED_CC_PLACEHOLDER]", 1) # Avoid using *** for this
+            idx += 1
+        else:
+            break # No more placeholders with the current idx, exit loop
+    # END CC RESTORE LOGIC
+
     return text
 
 def generate_session_colors(df):
